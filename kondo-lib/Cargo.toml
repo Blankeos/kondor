@@ -10,4 +10,5 @@ license = "MIT"
 
 [dependencies]
 ignore = "0.4.25"
+rayon = "1.12.0"
 walkdir = "2"

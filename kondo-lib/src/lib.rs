@@ -227,6 +227,18 @@ impl Project {
         Ok(most_recent_modified)
     }
 
+    pub fn artifact_last_modified(&self) -> Result<SystemTime, std::io::Error> {
+        self.artifact_dirs()
+            .iter()
+            .copied()
+            .map(|d| self.path.join(d))
+            .filter(|p| p.exists())
+            .try_fold(SystemTime::UNIX_EPOCH, |acc, p| {
+                let m = fs::metadata(&p)?.modified()?;
+                Ok(if m > acc { m } else { acc })
+            })
+    }
+
     pub fn size_dirs(&self, options: &ScanOptions) -> ProjectSize {
         let mut artifact_size = 0;
         let mut non_artifact_size = 0;

@@ -1,5 +1,5 @@
 [workspace]
-members = ["kondo", "kondo-lib", "kondo-ui"]
+members = ["kondo", "kondo-lib"]
 default-members = ["kondo"]
 resolver = "2"
 

@@ -1,27 +1,16 @@
 [package]
-name = "kondo"
-version = "0.9.0"
-authors = ["Trent Billington <trent.h.billington@gmail.com>"]
-description = """
-kondo is a filesystem cleaning tool that recursively searches directories
-for known project structures and determines how much space you could save by
-deleting the unnecessary files.
-"""
-documentation = "https://github.com/tbillington/kondo"
-homepage = "https://github.com/tbillington/kondo"
-repository = "https://github.com/tbillington/kondo"
-readme = "../README.md"
-categories = ["command-line-utilities"]
-license = "MIT"
-keywords = ["clean", "cleanup", "delete", "free"]
-exclude = ["test_dir"]
+name = "kondor"
+version = "0.1.0"
 edition = "2021"
-
+description = "Minimal TUI filesystem cleaner for project artifact directories"
+license = "MIT"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-console = "0.15"
+crossterm = "0.29"
+ratatui = "0.29"
+rayon = "1.12.0"
 
 [dependencies.kondo-lib]
 path = "../kondo-lib"
