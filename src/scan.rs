@@ -154,11 +154,8 @@ pub fn measure(path: PathBuf, kinds: Vec<Kind>, artifact_names: &[&'static str])
     let mut newest = 0u64;
     for &rel in artifact_names {
         let dir = path.join(rel);
-        // symlink_metadata: a symlinked `node_modules` is not ours to measure.
-        let Ok(meta) = fs::symlink_metadata(&dir) else { continue };
-        if !meta.is_dir() {
-            continue;
-        }
+        // A symlinked `node_modules` (or parent, like `ios/`) is not ours to measure.
+        let Ok(Some(meta)) = crate::clean::artifact_dir(&path, rel) else { continue };
         let acc = Acc::default();
         acc.add(&[meta]);
         tree(&dir, &acc);

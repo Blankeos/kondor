@@ -237,8 +237,14 @@ impl App {
         if changed {
             self.rebuild();
         }
+        let mut cleaned = false;
         while let Ok(outcome) = self.clean_rx.try_recv() {
             self.finish_clean(outcome);
+            cleaned = true;
+        }
+        if cleaned {
+            // Partial failures shrink a project's size, which can move it.
+            self.rebuild();
             changed = true;
         }
         if self.toast.as_ref().is_some_and(|t| t.at.elapsed() > Duration::from_secs(6)) {
@@ -595,7 +601,10 @@ impl App {
             e.status = Status::Cleaned;
             self.batch.1 += 1;
         } else {
-            e.status = if out.freed > 0 { Status::Cleaned } else { Status::Failed(out.errors.join("; ")) };
+            // Keep what's left so it shows up as failed and can be retried.
+            e.artifacts.retain(|a| !out.removed.contains(&a.rel));
+            e.bytes = e.artifacts.iter().map(|a| a.bytes).sum();
+            e.status = Status::Failed(out.errors.join("; "));
             self.batch.2 += 1;
             self.notify(format!("Couldn't fully clean {name}: {}", out.errors[0]), Tone::Bad);
         }
@@ -698,6 +707,26 @@ mod tests {
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 4));
         assert!(app.selected().unwrap().marked);
         assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn partial_failure_stays_retryable() {
+        let mut app = app_with(1, 10);
+        let e = &mut app.entries[0];
+        e.artifacts = vec![Artifact { rel: "node_modules", bytes: 700 }, Artifact { rel: ".angular", bytes: 300 }];
+        e.bytes = 1000;
+        e.status = Status::Cleaning;
+        app.pending = 1;
+        app.finish_clean(Outcome {
+            id: 0,
+            freed: 700,
+            removed: vec!["node_modules"],
+            errors: vec![".angular: permission denied".into()],
+        });
+        let e = &app.entries[0];
+        assert!(matches!(e.status, Status::Failed(_)));
+        assert!(e.is_ready());
+        assert_eq!((e.bytes, e.artifacts.len(), app.freed), (300, 1, 700));
     }
 
     #[test]

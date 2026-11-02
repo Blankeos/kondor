@@ -38,7 +38,8 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from);
+    let home =
+        ["HOME", "USERPROFILE"].iter().find_map(|k| std::env::var_os(k).filter(|h| !h.is_empty())).map(PathBuf::from);
     let roots = resolve_roots(&args.paths)?;
 
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
