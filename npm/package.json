@@ -1,0 +1,40 @@
+{
+  "name": "kondor",
+  "version": "0.1.0",
+  "description": "Find and clear build leftovers (node_modules, target, caches) across all your projects",
+  "main": "bin.js",
+  "bin": {
+    "kondor": "./bin.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Blankeos/kondor.git"
+  },
+  "keywords": [
+    "disk-space",
+    "cleaner",
+    "node-modules",
+    "cleanup",
+    "tui",
+    "cli",
+    "rust"
+  ],
+  "author": "Blankeos",
+  "license": "MIT",
+  "files": [
+    "install.js",
+    "bin.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=12"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}
