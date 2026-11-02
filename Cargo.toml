@@ -1,15 +1,32 @@
-[workspace]
-members = ["kondo", "kondo-lib"]
-default-members = ["kondo"]
-resolver = "2"
+[package]
+name = "kondor-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Find and clear build leftovers (node_modules, target, caches) across all your projects"
+license = "MIT"
+repository = "https://github.com/Blankeos/kondor"
+homepage = "https://github.com/Blankeos/kondor"
+readme = "README.md"
+keywords = ["disk-space", "cleaner", "node-modules", "tui", "cli"]
+categories = ["command-line-utilities", "filesystem", "development-tools"]
+exclude = [".github/", "assets/", ".vscode/", "npm/", "scripts/", "justfile", "dist-workspace.toml", "rustfmt.toml"]
 
-[profile.dev]
-debug = "line-tables-only"
+[[bin]]
+# The crates.io name `kondor` belongs to another project; the command is still `kondor`.
+name = "kondor"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "wrap_help"] }
+clap_complete = "4"
+# crossterm comes re-exported from ratatui so only one copy is compiled.
+ratatui = "0.29"
+rayon = "1.10"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
-# If we don't use these the bevy executable is 200mb+ :(
 debug = false
 panic = "abort"
 strip = true
