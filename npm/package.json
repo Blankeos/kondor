@@ -1,6 +1,6 @@
 {
   "name": "kondor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Find and clear build leftovers (node_modules, target, caches) across all your projects",
   "main": "bin.js",
   "bin": {
