@@ -1,5 +1,6 @@
 //! Application state and input handling. Rendering lives in `ui.rs`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering::Relaxed;
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 
+use crate::cache::{self, Cache};
 use crate::clean::{self, Job, Outcome};
 use crate::cli::SortBy;
 use crate::format::{self, plural};
@@ -25,6 +27,16 @@ pub enum Status {
     Failed(String),
 }
 
+/// How much to trust `Entry::bytes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeState {
+    /// Not measured yet; `bytes` is meaningless.
+    Pending,
+    /// From the cache of an earlier run; being re-measured.
+    Stale,
+    Fresh,
+}
+
 pub struct Entry {
     pub id: usize,
     pub path: PathBuf,
@@ -38,11 +50,16 @@ pub struct Entry {
     pub age: Option<u64>,
     pub marked: bool,
     pub status: Status,
+    pub size: SizeState,
+    /// Newer than `--older` (known only once the age is).
+    recent: bool,
+    /// Its artifact folders turned out to be gone.
+    pub gone: bool,
     haystack: String,
 }
 
 impl Entry {
-    pub fn from_found(id: usize, f: Found, home: Option<&Path>, now: SystemTime) -> Self {
+    pub fn from_found(id: usize, f: Found, home: Option<&Path>, now: SystemTime, size: SizeState) -> Self {
         let name = f
             .path
             .file_name()
@@ -63,12 +80,36 @@ impl Entry {
             age,
             marked: false,
             status: Status::Ready,
+            size,
+            recent: false,
+            gone: false,
             haystack,
         }
     }
 
     pub fn is_ready(&self) -> bool {
         matches!(self.status, Status::Ready | Status::Failed(_))
+    }
+
+    /// Can be marked and deleted: not busy, and measured (or at least known
+    /// from the cache). A row that is still pending has no numbers to confirm.
+    pub fn actionable(&self) -> bool {
+        self.is_ready() && !self.gone && self.size != SizeState::Pending
+    }
+
+    /// Take a fresh measurement. Ignored while the project is being cleaned.
+    fn apply(&mut self, f: Found, now: SystemTime) {
+        if !self.is_ready() {
+            return;
+        }
+        self.gone = f.artifacts.is_empty();
+        if self.gone {
+            self.marked = false;
+        }
+        self.age = f.newest.map(|t| now.duration_since(t).unwrap_or_default().as_secs());
+        self.artifacts = f.artifacts;
+        self.bytes = f.bytes;
+        self.size = SizeState::Fresh;
     }
 }
 
@@ -135,14 +176,24 @@ pub struct App {
     pub min_age: Option<u64>,
     /// Projects found but hidden because they're newer than `--older`.
     pub hidden_recent: usize,
+    /// Until everything (walk and sizing) is finished.
     pub scanning: bool,
+    /// The folder walk itself is still going.
+    pub walking: bool,
     pub scan_time: Option<Duration>,
     pub progress: Arc<Progress>,
     pub max_bytes: u64,
+    pub total_bytes: u64,
     pub pending: usize,
     pub freed: u64,
     pub freed_projects: usize,
     batch: (u64, usize, usize),
+    index: HashMap<PathBuf, usize>,
+    /// Measurements from this run, for the cache.
+    fresh: Cache,
+    old_cache: Cache,
+    cache_path: Option<PathBuf>,
+    cache_saved: bool,
     pub toast: Option<Toast>,
     pub spin: usize,
     pub theme: Theme,
@@ -159,6 +210,9 @@ pub struct Config {
     pub sort: SortBy,
     pub dry_run: bool,
     pub min_age: Option<u64>,
+    /// Where to keep sizes between runs (`None`: no cache).
+    pub cache_path: Option<PathBuf>,
+    pub old_cache: Cache,
 }
 
 impl App {
@@ -183,13 +237,20 @@ impl App {
             min_age: cfg.min_age,
             hidden_recent: 0,
             scanning: true,
+            walking: true,
             scan_time: None,
             progress,
             max_bytes: 0,
+            total_bytes: 0,
             pending: 0,
             freed: 0,
             freed_projects: 0,
             batch: (0, 0, 0),
+            index: HashMap::new(),
+            fresh: Cache::default(),
+            old_cache: cfg.old_cache,
+            cache_saved: cfg.cache_path.is_none(),
+            cache_path: cfg.cache_path,
             toast: None,
             spin: 0,
             theme: Theme::detect(),
@@ -212,24 +273,39 @@ impl App {
         let now = SystemTime::now();
         loop {
             match self.scan_rx.try_recv() {
-                Ok(Msg::Found(found)) => {
-                    let entry = Entry::from_found(self.entries.len(), found, self.home.as_deref(), now);
-                    if self.min_age.is_some_and(|min| entry.age.is_some_and(|a| a < min)) {
-                        self.hidden_recent += 1;
-                    } else {
-                        self.entries.push(entry);
+                Ok(Msg::Discovered { found, cached }) => {
+                    let id = self.entries.len();
+                    let size = if cached { SizeState::Stale } else { SizeState::Pending };
+                    self.index.insert(found.path.clone(), id);
+                    self.entries.push(Entry::from_found(id, found, self.home.as_deref(), now, size));
+                    self.refresh_recent(id);
+                    changed = true;
+                }
+                Ok(Msg::Sized(found)) => {
+                    self.fresh.record(&found, cache::unix_secs(now));
+                    if let Some(&id) = self.index.get(&found.path) {
+                        self.entries[id].apply(found, now);
+                        self.refresh_recent(id);
                     }
                     changed = true;
                 }
-                Ok(Msg::Done { elapsed }) => {
-                    self.scanning = false;
+                Ok(Msg::WalkDone { elapsed }) => {
+                    self.walking = false;
                     self.scan_time = Some(elapsed);
+                    changed = true;
+                }
+                Ok(Msg::Done { elapsed }) => {
+                    self.walking = false;
+                    self.scanning = false;
+                    self.scan_time.get_or_insert(elapsed);
+                    self.save_cache();
                     changed = true;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     changed |= self.scanning;
                     self.scanning = false;
+                    self.walking = false;
                     break;
                 }
             }
@@ -254,13 +330,62 @@ impl App {
         changed
     }
 
+    /// Entries still waiting for a measurement.
+    pub fn unsized_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.size != SizeState::Fresh && !e.gone).count()
+    }
+
+    /// Share of live entries already measured, 0..=100 (99 until all are).
+    pub fn sized_percent(&self) -> u64 {
+        let total = self.entries.iter().filter(|e| !e.gone).count() as u64;
+        if total == 0 {
+            return 0;
+        }
+        let remaining = self.unsized_count() as u64;
+        let pct = total.saturating_sub(remaining) * 100 / total;
+        if remaining > 0 {
+            pct.min(99)
+        } else {
+            pct.min(100)
+        }
+    }
+
+    /// Apply `--older`. Rows with an unknown age stay visible until measured.
+    fn refresh_recent(&mut self, id: usize) {
+        let min = self.min_age;
+        let e = &mut self.entries[id];
+        e.recent = match (min, e.age) {
+            (Some(min), Some(age)) => age < min,
+            _ => false,
+        };
+        if e.recent {
+            e.marked = false;
+        }
+    }
+
+    /// Write the cache (once): last run's numbers plus this run's.
+    pub fn save_cache(&mut self) {
+        if self.cache_saved {
+            return;
+        }
+        self.cache_saved = true;
+        if let Some(path) = &self.cache_path {
+            // Best effort: a cache that can't be written is not an error.
+            let _ = self.old_cache.save_merged(&self.fresh, &self.roots, path);
+        }
+    }
+
     /// Re-filter and re-sort, keeping the same project under the cursor.
     pub fn rebuild(&mut self) {
         let keep = self.selected().map(|e| e.id);
         let terms: Vec<String> = self.filter.to_lowercase().split_whitespace().map(String::from).collect();
         let entries = &self.entries;
-        self.view =
-            (0..entries.len()).filter(|&i| terms.iter().all(|t| entries[i].haystack.contains(t.as_str()))).collect();
+        self.view = (0..entries.len())
+            .filter(|&i| {
+                let e = &entries[i];
+                !e.gone && !e.recent && terms.iter().all(|t| e.haystack.contains(t.as_str()))
+            })
+            .collect();
         match self.sort {
             SortBy::Size => self.view.sort_by(|&a, &b| entries[b].bytes.cmp(&entries[a].bytes)),
             SortBy::Age => self.view.sort_by(|&a, &b| entries[b].age.cmp(&entries[a].age)),
@@ -268,7 +393,9 @@ impl App {
                 self.view.sort_by_cached_key(|&i| (entries[i].name.to_lowercase(), entries[i].location.clone()))
             }
         }
-        self.max_bytes = entries.iter().map(|e| e.bytes).max().unwrap_or(0);
+        self.max_bytes = entries.iter().filter(|e| !e.gone && !e.recent).map(|e| e.bytes).max().unwrap_or(0);
+        self.total_bytes = entries.iter().filter(|e| !e.gone).map(|e| e.bytes).sum();
+        self.hidden_recent = entries.iter().filter(|e| e.recent && !e.gone).count();
         self.cursor = keep
             .and_then(|id| self.view.iter().position(|&i| i == id))
             .unwrap_or(self.cursor)
@@ -285,11 +412,11 @@ impl App {
     }
 
     pub fn marked(&self) -> (usize, u64) {
-        self.entries.iter().filter(|e| e.marked && e.is_ready()).fold((0, 0), |(n, b), e| (n + 1, b + e.bytes))
+        self.entries.iter().filter(|e| e.marked && e.actionable()).fold((0, 0), |(n, b), e| (n + 1, b + e.bytes))
     }
 
     pub fn reclaimable(&self) -> (usize, u64) {
-        self.entries.iter().filter(|e| e.is_ready()).fold((0, 0), |(n, b), e| (n + 1, b + e.bytes))
+        self.entries.iter().filter(|e| e.actionable() && !e.recent).fold((0, 0), |(n, b), e| (n + 1, b + e.bytes))
     }
 
     pub fn notify(&mut self, text: impl Into<String>, tone: Tone) {
@@ -511,7 +638,7 @@ impl App {
 
     fn toggle_mark(&mut self, advance: bool) {
         if let Some(e) = self.selected_mut() {
-            if e.is_ready() {
+            if e.actionable() {
                 e.marked = !e.marked;
             }
         }
@@ -522,10 +649,10 @@ impl App {
 
     /// Mark every visible project; if they're all marked already, unmark them.
     fn toggle_all(&mut self) {
-        let all = self.view.iter().all(|&i| !self.entries[i].is_ready() || self.entries[i].marked);
+        let all = self.view.iter().all(|&i| !self.entries[i].actionable() || self.entries[i].marked);
         for &i in &self.view {
             let e = &mut self.entries[i];
-            if e.is_ready() {
+            if e.actionable() {
                 e.marked = !all;
             }
         }
@@ -560,10 +687,11 @@ impl App {
 
     /// Delete the marked projects, or the selected one if nothing is marked.
     fn ask_delete(&mut self) {
-        let mut ids: Vec<usize> = self.entries.iter().filter(|e| e.marked && e.is_ready()).map(|e| e.id).collect();
+        let mut ids: Vec<usize> = self.entries.iter().filter(|e| e.marked && e.actionable()).map(|e| e.id).collect();
         if ids.is_empty() {
             match self.selected() {
-                Some(e) if e.is_ready() => ids.push(e.id),
+                Some(e) if e.actionable() => ids.push(e.id),
+                Some(e) if e.is_ready() => return self.notify("Still measuring, try again in a moment", Tone::Info),
                 Some(_) => return self.notify("Already cleaned", Tone::Info),
                 None => return,
             }
@@ -577,7 +705,7 @@ impl App {
         self.mode = Mode::Normal;
         for id in ids {
             let e = &mut self.entries[id];
-            if !e.is_ready() {
+            if !e.actionable() {
                 continue;
             }
             e.marked = false;
@@ -654,14 +782,23 @@ mod tests {
             let found = Found {
                 path: PathBuf::from(format!("/p/proj{i:02}")),
                 kinds: vec![Kind::Node],
-                artifacts: vec![Artifact { rel: "node_modules", bytes: 1000 * (n - i) as u64 }],
+                artifacts: vec![Artifact { rel: "node_modules", bytes: 1000 * (n - i) as u64, newest: None }],
                 bytes: 1000 * (n - i) as u64,
                 newest: None,
             };
-            tx.send(Msg::Found(found)).unwrap();
+            tx.send(Msg::Discovered { found: found.clone(), cached: false }).unwrap();
+            tx.send(Msg::Sized(found)).unwrap();
         }
         drop(tx);
-        let cfg = Config { roots: vec![], home: None, sort: SortBy::Size, dry_run: true, min_age: None };
+        let cfg = Config {
+            roots: vec![],
+            home: None,
+            sort: SortBy::Size,
+            dry_run: true,
+            min_age: None,
+            cache_path: None,
+            old_cache: Cache::default(),
+        };
         let mut app = App::new(cfg, rx, Arc::new(Progress::default()));
         app.update();
         app.page = page;
@@ -713,7 +850,10 @@ mod tests {
     fn partial_failure_stays_retryable() {
         let mut app = app_with(1, 10);
         let e = &mut app.entries[0];
-        e.artifacts = vec![Artifact { rel: "node_modules", bytes: 700 }, Artifact { rel: ".angular", bytes: 300 }];
+        e.artifacts = vec![
+            Artifact { rel: "node_modules", bytes: 700, newest: None },
+            Artifact { rel: ".angular", bytes: 300, newest: None },
+        ];
         e.bytes = 1000;
         e.status = Status::Cleaning;
         app.pending = 1;
@@ -740,5 +880,92 @@ mod tests {
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 70, 20));
         assert_eq!(app.mode, Mode::Normal);
         assert!(app.entries.iter().all(|e| e.status == Status::Ready));
+    }
+
+    fn found(path: &str, bytes: u64, age_secs: Option<u64>) -> Found {
+        let newest = age_secs.map(|a| SystemTime::now() - Duration::from_secs(a));
+        Found {
+            path: PathBuf::from(path),
+            kinds: vec![Kind::Node],
+            artifacts: if bytes == 0 { vec![] } else { vec![Artifact { rel: "node_modules", bytes, newest }] },
+            bytes,
+            newest,
+        }
+    }
+
+    fn live_app(min_age: Option<u64>) -> (App, Sender<Msg>) {
+        let (tx, rx) = mpsc::channel();
+        let cfg = Config {
+            roots: vec![],
+            home: None,
+            sort: SortBy::Size,
+            dry_run: true,
+            min_age,
+            cache_path: None,
+            old_cache: Cache::default(),
+        };
+        (App::new(cfg, rx, Arc::new(Progress::default())), tx)
+    }
+
+    #[test]
+    fn pending_row_becomes_sized_and_resorts() {
+        let (mut app, tx) = live_app(None);
+        tx.send(Msg::Discovered { found: found("/p/a", 0, None), cached: false }).unwrap();
+        tx.send(Msg::Discovered { found: found("/p/b", 0, None), cached: false }).unwrap();
+        app.update();
+        assert_eq!(app.view.len(), 2);
+        assert!(app.entries.iter().all(|e| e.size == SizeState::Pending));
+        assert_eq!(app.unsized_count(), 2);
+
+        // Pending rows can't be marked or deleted.
+        app.on_key(key(KeyCode::Char(' ')));
+        assert!(!app.entries[0].marked);
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.mode, Mode::Normal);
+
+        tx.send(Msg::Sized(found("/p/b", 5000, Some(100)))).unwrap();
+        tx.send(Msg::Sized(found("/p/a", 100, Some(100)))).unwrap();
+        app.update();
+        assert_eq!(app.unsized_count(), 0);
+        assert_eq!(app.entries[app.view[0]].name, "b", "biggest first once sizes land");
+        assert_eq!((app.entries[0].bytes, app.entries[0].size), (100, SizeState::Fresh));
+        app.on_key(key(KeyCode::Char('d')));
+        assert!(matches!(app.mode, Mode::Confirm(_)));
+    }
+
+    #[test]
+    fn cached_rows_are_stale_until_measured() {
+        let (mut app, tx) = live_app(None);
+        tx.send(Msg::Discovered { found: found("/p/a", 777, Some(10)), cached: true }).unwrap();
+        app.update();
+        assert_eq!((app.entries[0].bytes, app.entries[0].size), (777, SizeState::Stale));
+        tx.send(Msg::Sized(found("/p/a", 888, Some(10)))).unwrap();
+        app.update();
+        assert_eq!((app.entries[0].bytes, app.entries[0].size), (888, SizeState::Fresh));
+    }
+
+    #[test]
+    fn min_age_applies_once_age_is_known() {
+        let (mut app, tx) = live_app(Some(1000));
+        tx.send(Msg::Discovered { found: found("/p/new", 0, None), cached: false }).unwrap();
+        tx.send(Msg::Discovered { found: found("/p/old", 0, None), cached: false }).unwrap();
+        app.update();
+        assert_eq!(app.view.len(), 2, "unknown age stays visible");
+        tx.send(Msg::Sized(found("/p/new", 10, Some(5)))).unwrap();
+        tx.send(Msg::Sized(found("/p/old", 10, Some(5000)))).unwrap();
+        app.update();
+        assert_eq!(app.view.len(), 1);
+        assert_eq!(app.entries[app.view[0]].name, "old");
+        assert_eq!(app.hidden_recent, 1);
+    }
+
+    #[test]
+    fn vanished_artifacts_remove_the_row() {
+        let (mut app, tx) = live_app(None);
+        tx.send(Msg::Discovered { found: found("/p/a", 0, None), cached: false }).unwrap();
+        tx.send(Msg::Sized(found("/p/a", 0, None))).unwrap();
+        app.update();
+        assert!(app.view.is_empty());
+        assert_eq!(app.hidden_recent, 0);
     }
 }

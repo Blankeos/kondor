@@ -55,6 +55,20 @@ pub struct Args {
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 
+    /// Don't read or write the size cache
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Scan headless and print timings (for benchmarking)
+    #[arg(long, hide = true)]
+    pub bench: bool,
+
+    #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
+    pub walk_threads: usize,
+
+    #[arg(long, hide = true, value_name = "N", default_value_t = 0)]
+    pub size_threads: usize,
+
     /// Print a shell completion script and exit
     #[arg(long, value_name = "SHELL", exclusive = true)]
     pub completions: Option<Shell>,

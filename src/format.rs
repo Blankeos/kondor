@@ -131,6 +131,15 @@ pub fn truncate(s: &str, width: usize) -> String {
     format!("{head}…")
 }
 
+/// Share of `total` as `"42%"` / `"<1%"`; `None` when unknown (no bytes or total).
+pub fn percent(bytes: u64, total: u64) -> Option<String> {
+    if bytes == 0 || total == 0 {
+        return None;
+    }
+    let pct = (bytes as f64 * 100.0 / total as f64).min(100.0);
+    Some(if pct < 1.0 { "<1%".into() } else { format!("{}%", pct.round()) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +172,15 @@ mod tests {
         assert!(parse_age("30").is_err());
         assert!(parse_age("d").is_err());
         assert!(parse_age("3x").is_err());
+    }
+
+    #[test]
+    fn percents() {
+        assert_eq!(percent(0, 100), None);
+        assert_eq!(percent(5, 0), None);
+        assert_eq!(percent(1, 1000), Some("<1%".into()));
+        assert_eq!(percent(1, 3), Some("33%".into()));
+        assert_eq!(percent(200, 100), Some("100%".into()));
     }
 
     #[test]

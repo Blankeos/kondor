@@ -9,13 +9,14 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, Entry, Mode, Status, Tone};
+use crate::app::{App, Entry, Mode, SizeState, Status, Tone};
 use crate::cli::SortBy;
 use crate::format::{self, plural, truncate, truncate_left};
 use crate::theme::Theme;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const BAR_WIDTH: u16 = 10;
+const SIZE_W: u16 = 9;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area().inner(ratatui::layout::Margin { horizontal: 1, vertical: 0 });
@@ -52,10 +53,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
 
     let dirs = format::count(app.dirs_scanned());
-    let right = if app.scanning {
+    let remaining = app.unsized_count();
+    let pct = app.sized_percent();
+    let right = if app.walking {
         Line::from(vec![
             Span::styled(spinner(app), t.accent()),
             Span::styled(format!(" Scanning · {dirs} folders"), t.dim()),
+        ])
+    } else if app.scanning {
+        Line::from(vec![
+            Span::styled(spinner(app), t.accent()),
+            Span::styled(format!(" Sizing · {pct}% · {remaining} remaining · {dirs} folders"), t.dim()),
         ])
     } else {
         let secs = app.scan_time.map(|d| format!(" in {:.1}s", d.as_secs_f64())).unwrap_or_default();
@@ -95,11 +103,13 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
     let name_w = window.iter().map(|&i| app.entries[i].name.chars().count()).max().unwrap_or(8).clamp(8, 32) as u16;
     let type_w = window.iter().map(|&i| app.entries[i].kinds.chars().count()).max().unwrap_or(4).clamp(4, 18) as u16;
 
-    let mut widths = vec![Constraint::Length(2), Constraint::Length(9)];
+    let mut widths = vec![Constraint::Length(2), Constraint::Length(SIZE_W)];
     let mut head = vec![Cell::from(""), header_cell(&t, "SIZE", app.sort == SortBy::Size, true)];
     if show_bar {
         widths.push(Constraint::Length(BAR_WIDTH));
         head.push(Cell::from(""));
+        widths.push(Constraint::Length(4));
+        head.push(header_cell(&t, "%", false, true));
     }
     widths.push(if show_loc { Constraint::Length(name_w) } else { Constraint::Fill(1) });
     head.push(header_cell(&t, "PROJECT", app.sort == SortBy::Name, false));
@@ -126,9 +136,13 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(n, &i)| {
             let e = &app.entries[i];
-            let mut cells = vec![Cell::from(mark_cell(app, e, Some(n) == selected)), Cell::from(size_cell(&t, e))];
+            let mut cells = vec![Cell::from(mark_cell(app, e, Some(n) == selected)), Cell::from(size_cell(app, e))];
             if show_bar {
                 cells.push(Cell::from(bar(&t, e, app.max_bytes)));
+                let pct = if e.size == SizeState::Fresh { format::percent(e.bytes, app.total_bytes) } else { None };
+                let pct_style = if pct.as_deref().is_some_and(|p| p != "<1%") { t.dim() } else { t.faint() };
+                let pct = pct.unwrap_or_else(|| "–".into());
+                cells.push(Cell::from(Line::from(Span::styled(pct, pct_style)).alignment(Alignment::Right)));
             }
             let name_style = if e.is_ready() { t.strong() } else { t.dim() };
             cells.push(Cell::from(Span::styled(truncate(&e.name, name_w as usize), name_style)));
@@ -147,7 +161,7 @@ fn draw_body(f: &mut Frame, app: &mut App, area: Rect) {
     let table_area = Rect { width: area.width.saturating_sub(1), ..area };
     // Same layout the table uses internally, to map header clicks to columns.
     let cols = Layout::horizontal(widths.clone()).flex(Flex::Start).spacing(1).split(table_area);
-    let project_col = if show_bar { 3 } else { 2 };
+    let project_col = if show_bar { 4 } else { 2 };
     let header_cell_rect = |i: usize| Rect { height: 1, ..cols[i] };
     app.hit.sort_cols = vec![
         (header_cell_rect(1), SortBy::Size),
@@ -201,7 +215,13 @@ fn mark_cell<'a>(app: &App, e: &Entry, selected: bool) -> Line<'a> {
     Line::from(vec![gutter, mark])
 }
 
-fn size_cell<'a>(t: &Theme, e: &Entry) -> Line<'a> {
+fn size_cell<'a>(app: &App, e: &Entry) -> Line<'a> {
+    let t = &app.theme;
+    let sizing = app.scanning && !e.gone && e.size != SizeState::Fresh && e.status == Status::Ready;
+    if e.size == SizeState::Pending {
+        let span = if sizing { Span::styled(spinner(app), t.accent()) } else { Span::styled("…", t.faint()) };
+        return Line::from(span).alignment(Alignment::Right);
+    }
     let text = format::size(e.bytes);
     let style = match e.status {
         Status::Cleaning => t.dim(),
@@ -211,11 +231,29 @@ fn size_cell<'a>(t: &Theme, e: &Entry) -> Line<'a> {
         Status::Ready if e.bytes >= 100_000_000 => t.text(),
         Status::Ready => t.dim(),
     };
+    // Last run's number: shown, but quieter until it's re-measured.
+    let style = if e.size == SizeState::Stale && e.status == Status::Ready { t.faint() } else { style };
+    // Re-measuring: spinner ahead of the last known size (when it fits the column).
+    if sizing && text.chars().count() + 2 <= SIZE_W as usize {
+        let line = Line::from(vec![Span::styled(spinner(app), t.accent()), Span::styled(format!(" {text}"), style)]);
+        return line.alignment(Alignment::Right);
+    }
     Line::from(Span::styled(text, style)).alignment(Alignment::Right)
 }
 
+/// A size for display; `…` while unmeasured.
+fn shown(e: &Entry, bytes: u64) -> String {
+    if e.size == SizeState::Pending {
+        "…".into()
+    } else {
+        format::size(bytes)
+    }
+}
+
 fn bar<'a>(t: &Theme, e: &Entry, max: u64) -> Span<'a> {
-    Span::styled(bar_text(e.bytes, max, BAR_WIDTH as usize), if e.is_ready() { t.accent() } else { t.faint() })
+    let bytes = if e.size == SizeState::Pending { 0 } else { e.bytes };
+    let live = e.is_ready() && e.size == SizeState::Fresh;
+    Span::styled(bar_text(bytes, max, BAR_WIDTH as usize), if live { t.accent() } else { t.faint() })
 }
 
 fn bar_text(bytes: u64, max: u64, width: usize) -> String {
@@ -239,7 +277,7 @@ fn draw_empty(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(spinner(app), t.accent()),
             Span::styled(" Looking for build leftovers…", t.strong()),
         ]));
-        lines.push(Line::styled("Projects show up here as soon as they're measured.", t.dim()));
+        lines.push(Line::styled("Projects show up here as soon as they're found.", t.dim()));
     } else {
         lines.push(Line::styled("✓ All clean", t.good().add_modifier(Modifier::BOLD)));
         lines.push(Line::styled("No build artifacts found here.", t.dim()));
@@ -393,6 +431,8 @@ fn draw_info(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     let t = &app.theme;
     let label = |s: &'static str| Span::styled(format!("{s:<12}"), t.faint());
     let status = match &e.status {
+        Status::Ready if e.size == SizeState::Pending => Span::styled("Measuring…", t.dim()),
+        Status::Ready if e.size == SizeState::Stale => Span::styled("Ready to clean (size from last run)", t.text()),
         Status::Ready if e.marked => Span::styled("Marked for deletion", t.accent()),
         Status::Ready => Span::styled("Ready to clean", t.text()),
         Status::Cleaning => Span::styled("Deleting…", t.accent()),
@@ -418,7 +458,7 @@ fn draw_info(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     for a in &e.artifacts {
         lines.push(Line::from(vec![
             Span::raw(format!("{:<name_w$}", truncate(a.rel, name_w))),
-            Span::styled(format!("{:>9}", format::size(a.bytes)), t.strong()),
+            Span::styled(format!("{:>9}", shown(e, a.bytes)), t.strong()),
             Span::raw("  "),
             Span::styled(bar_text(a.bytes, max, 12), t.accent()),
         ]));
@@ -426,7 +466,7 @@ fn draw_info(f: &mut Frame, app: &App, area: Rect) -> Option<Rect> {
     lines.push(Line::from(Span::styled("─".repeat(name_w + 9), t.faint())));
     lines.push(Line::from(vec![
         Span::styled(format!("{:<name_w$}", "Total"), t.dim()),
-        Span::styled(format!("{:>9}", format::size(e.bytes)), t.accent().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:>9}", shown(e, e.bytes)), t.accent().add_modifier(Modifier::BOLD)),
     ]));
 
     let title = Line::from(Span::styled(format!(" {} ", e.name), t.strong()));
