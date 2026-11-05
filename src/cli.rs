@@ -20,6 +20,8 @@ pub enum SortBy {
 /// Find and clear build leftovers (node_modules, target, caches) across all your projects.
 ///
 /// Nothing is deleted until you mark projects and confirm.
+///
+/// Run `kondor upgrade` to update to the latest release.
 #[derive(Debug, Parser)]
 #[command(name = "kondor", version, about, long_about = None)]
 pub struct Args {
