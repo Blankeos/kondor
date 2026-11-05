@@ -15,6 +15,8 @@ cargo binstall kondor-cli          # or prebuilt via cargo-binstall
 cargo install kondor-cli           # or build from source
 ```
 
+Update with `kondor upgrade`. It runs whichever of the above you installed with.
+
 ## Use
 
 ```sh

@@ -7,6 +7,7 @@ mod project;
 mod scan;
 mod theme;
 mod ui;
+mod upgrade;
 
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,11 @@ use crate::cli::Args;
 use crate::scan::{Msg, Progress};
 
 fn main() -> ExitCode {
+    // `kondor upgrade` is handled before the folder arguments, which would take it for a path.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("upgrade") {
+        return upgrade::run(&argv[1..]);
+    }
     let args = Args::parse();
 
     if let Some(shell) = args.completions {
